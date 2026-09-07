@@ -488,6 +488,11 @@ _nns_edge_transfer_data (nns_edge_conn_s * conn, nns_edge_data_h data_h,
   unsigned int i;
   int ret;
 
+  if (!conn) {
+    nns_edge_loge ("Failed to transfer data, edge connection is null.");
+    return NNS_EDGE_ERROR_INVALID_PARAMETER;
+  }
+
   _nns_edge_cmd_init (&cmd, _NNS_EDGE_CMD_TRANSFER_DATA, client_id);
 
   ret = nns_edge_data_get_count (data_h, &cmd.info.num);
@@ -1071,7 +1076,7 @@ _nns_edge_accept_socket (nns_edge_handle_s * eh)
 {
   bool done = false;
   nns_edge_conn_s *conn;
-  nns_edge_conn_data_s *conn_data;
+  nns_edge_conn_data_s *conn_data = NULL;
   nns_edge_cmd_s cmd;
   int64_t client_id;
   char *dest_host = NULL;
@@ -1169,8 +1174,17 @@ _nns_edge_accept_socket (nns_edge_handle_s * eh)
   done = true;
 
 error:
-  if (!done)
+  if (!done) {
+    /** Detach the connection before releasing it, to avoid a double free. */
+    if (conn_data) {
+      if (conn_data->src_conn == conn)
+        conn_data->src_conn = NULL;
+      if (conn_data->sink_conn == conn)
+        conn_data->sink_conn = NULL;
+    }
+
     _nns_edge_close_connection (conn);
+  }
 
   SAFE_FREE (dest_host);
 }
