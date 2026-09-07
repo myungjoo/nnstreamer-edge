@@ -8,10 +8,13 @@
  */
 
 #include <gtest/gtest.h>
+#include <arpa/inet.h>
 #include <dirent.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
 #include <thread>
+#include <unistd.h>
 #include "nnstreamer-edge-data.h"
 #include "nnstreamer-edge-event.h"
 #include "nnstreamer-edge-log.h"
@@ -72,7 +75,9 @@ typedef struct {
   bool running;
   bool is_server;
   bool event_cb_released;
+  bool reject_connection;
   unsigned int received;
+  unsigned int connection_completed;
 } ne_test_data_s;
 
 /**
@@ -308,6 +313,245 @@ TEST (edge, connectLocal)
   _free_test_data (_td_server);
   _free_test_data (_td_client1);
   _free_test_data (_td_client2);
+}
+
+/**
+ * @brief Edge event callback rejecting a new connection, for test.
+ */
+static int
+_test_reject_connection_cb (nns_edge_event_h event_h, void *user_data)
+{
+  ne_test_data_s *_td = (ne_test_data_s *) user_data;
+  nns_edge_event_e event = NNS_EDGE_EVENT_UNKNOWN;
+  int ret;
+
+  ret = nns_edge_event_get_type (event_h, &event);
+  EXPECT_EQ (ret, NNS_EDGE_ERROR_NONE);
+
+  if (NNS_EDGE_EVENT_CONNECTION_COMPLETED == event && _td) {
+    _td->connection_completed++;
+
+    if (_td->reject_connection)
+      return NNS_EDGE_ERROR_UNKNOWN;
+  }
+
+  return NNS_EDGE_ERROR_NONE;
+}
+
+/**
+ * @brief Connect to the given port with a raw socket, for test.
+ */
+static int
+_test_open_raw_socket (int port)
+{
+  struct sockaddr_in saddr = { 0 };
+  int sockfd;
+
+  sockfd = socket (AF_INET, SOCK_STREAM, 0);
+  if (sockfd < 0)
+    return -1;
+
+  saddr.sin_family = AF_INET;
+  saddr.sin_addr.s_addr = inet_addr ("127.0.0.1");
+  saddr.sin_port = htons (port);
+
+  if (connect (sockfd, (struct sockaddr *) &saddr, sizeof (saddr)) < 0) {
+    close (sockfd);
+    return -1;
+  }
+
+  return sockfd;
+}
+
+/**
+ * @brief Start an edge handle listening on the local host, for test.
+ */
+static void
+_test_start_listener (nns_edge_node_type_e node_type, ne_test_data_s *_td,
+    nns_edge_h *edge_h, int *port)
+{
+  nns_edge_h handle;
+  char *val;
+  int ret;
+
+  *edge_h = NULL;
+  *port = nns_edge_get_available_port ();
+  ASSERT_TRUE (*port > 0);
+
+  ret = nns_edge_create_handle (
+      "temp-listener", NNS_EDGE_CONNECT_TYPE_TCP, node_type, &handle);
+  ASSERT_EQ (ret, NNS_EDGE_ERROR_NONE);
+
+  ret = nns_edge_set_event_callback (handle, _test_reject_connection_cb, _td);
+  EXPECT_EQ (ret, NNS_EDGE_ERROR_NONE);
+
+  ret = nns_edge_set_info (handle, "IP", "127.0.0.1");
+  EXPECT_EQ (ret, NNS_EDGE_ERROR_NONE);
+
+  val = nns_edge_strdup_printf ("%d", *port);
+  ret = nns_edge_set_info (handle, "PORT", val);
+  EXPECT_EQ (ret, NNS_EDGE_ERROR_NONE);
+  SAFE_FREE (val);
+
+  ret = nns_edge_set_info (handle, "CAPS", "test caps");
+  EXPECT_EQ (ret, NNS_EDGE_ERROR_NONE);
+
+  _td->handle = handle;
+  *edge_h = handle;
+
+  ret = nns_edge_start (handle);
+  ASSERT_EQ (ret, NNS_EDGE_ERROR_NONE);
+}
+
+/**
+ * @brief Open a raw connection and wait until the listener handles it.
+ */
+static int
+_test_connect_and_wait (int port, ne_test_data_s *_td, unsigned int expected)
+{
+  unsigned int retry = 0U;
+  int sockfd;
+
+  sockfd = _test_open_raw_socket (port);
+  if (sockfd < 0)
+    return -1;
+
+  do {
+    usleep (20000);
+  } while (_td->connection_completed < expected && retry++ < 200U);
+
+  return sockfd;
+}
+
+/**
+ * @brief Reject new connections of a listening node, and release the handle.
+ * @note The rejected connection should not be released twice.
+ */
+static void
+_test_reject_connections (nns_edge_node_type_e node_type)
+{
+  nns_edge_h edge_h;
+  ne_test_data_s *_td;
+  unsigned int i;
+  int ret, port, sockfd;
+
+  _td = _get_test_data (true);
+  ASSERT_TRUE (_td != NULL);
+  _td->reject_connection = true;
+
+  _test_start_listener (node_type, _td, &edge_h, &port);
+  ASSERT_TRUE (edge_h != NULL);
+
+  for (i = 1U; i <= 3U; i++) {
+    sockfd = _test_connect_and_wait (port, _td, i);
+    ASSERT_TRUE (sockfd >= 0);
+    EXPECT_EQ (_td->connection_completed, i);
+    close (sockfd);
+    usleep (100000);
+  }
+
+  ret = nns_edge_release_handle (edge_h);
+  EXPECT_EQ (ret, NNS_EDGE_ERROR_NONE);
+
+  _free_test_data (_td);
+}
+
+/**
+ * @brief The publisher rejects new connections in the event callback.
+ */
+TEST (edge, rejectPubConnection_n)
+{
+  _test_reject_connections (NNS_EDGE_NODE_TYPE_PUB);
+}
+
+/**
+ * @brief The query client rejects new connections in the event callback.
+ */
+TEST (edge, rejectQueryConnection_n)
+{
+  _test_reject_connections (NNS_EDGE_NODE_TYPE_QUERY_CLIENT);
+}
+
+/**
+ * @brief The peer disappears before the query server gets its host info.
+ */
+TEST (edge, acceptIncompleteConnection_n)
+{
+  nns_edge_h server_h;
+  ne_test_data_s *_td_server;
+  nns_edge_node_type_e node_type = NNS_EDGE_NODE_TYPE_QUERY_SERVER;
+  int ret, port, sockfd;
+
+  _td_server = _get_test_data (true);
+  ASSERT_TRUE (_td_server != NULL);
+
+  _test_start_listener (node_type, _td_server, &server_h, &port);
+  ASSERT_TRUE (server_h != NULL);
+
+  sockfd = _test_open_raw_socket (port);
+  ASSERT_TRUE (sockfd >= 0);
+  close (sockfd);
+  usleep (300000);
+
+  EXPECT_EQ (_td_server->connection_completed, 0U);
+
+  ret = nns_edge_release_handle (server_h);
+  EXPECT_EQ (ret, NNS_EDGE_ERROR_NONE);
+
+  _free_test_data (_td_server);
+}
+
+/**
+ * @brief Send data while a rejected connection is still in the table.
+ */
+TEST (edge, sendAfterRejectedConnection)
+{
+  nns_edge_h server_h;
+  ne_test_data_s *_td_server;
+  nns_edge_data_h data_h;
+  nns_size_t data_len;
+  void *data;
+  int ret, port, rejected_fd, accepted_fd;
+
+  _td_server = _get_test_data (true);
+  ASSERT_TRUE (_td_server != NULL);
+  _td_server->reject_connection = true;
+
+  _test_start_listener (NNS_EDGE_NODE_TYPE_PUB, _td_server, &server_h, &port);
+  ASSERT_TRUE (server_h != NULL);
+
+  rejected_fd = _test_connect_and_wait (port, _td_server, 1U);
+  ASSERT_TRUE (rejected_fd >= 0);
+  EXPECT_EQ (_td_server->connection_completed, 1U);
+
+  _td_server->reject_connection = false;
+  accepted_fd = _test_connect_and_wait (port, _td_server, 2U);
+  ASSERT_TRUE (accepted_fd >= 0);
+  EXPECT_EQ (_td_server->connection_completed, 2U);
+
+  data_len = 10U * sizeof (unsigned int);
+  data = malloc (data_len);
+  ASSERT_TRUE (data != NULL);
+
+  ret = nns_edge_data_create (&data_h);
+  EXPECT_EQ (ret, NNS_EDGE_ERROR_NONE);
+  ret = nns_edge_data_add (data_h, data, data_len, nns_edge_free);
+  EXPECT_EQ (ret, NNS_EDGE_ERROR_NONE);
+
+  ret = nns_edge_send (server_h, data_h);
+  EXPECT_EQ (ret, NNS_EDGE_ERROR_NONE);
+  usleep (300000);
+
+  ret = nns_edge_data_destroy (data_h);
+  EXPECT_EQ (ret, NNS_EDGE_ERROR_NONE);
+
+  close (rejected_fd);
+  close (accepted_fd);
+
+  ret = nns_edge_release_handle (server_h);
+  EXPECT_EQ (ret, NNS_EDGE_ERROR_NONE);
+
+  _free_test_data (_td_server);
 }
 
 /**
