@@ -42,6 +42,8 @@ typedef struct
   pthread_mutex_t lock;
   pthread_cond_t cond;
   bool cleared;
+  bool retained;
+  int clear_mid;
 } nns_edge_broker_s;
 
 /**
@@ -178,6 +180,8 @@ _nns_edge_mqtt_init_client (const char *id, const char *topic, const char *host,
   bh->event_cb = NULL;
   bh->user_data = NULL;
   bh->cleared = false;
+  bh->retained = false;
+  bh->clear_mid = 0;
   nns_edge_lock_init (bh);
   nns_edge_cond_init (bh);
 
@@ -245,42 +249,53 @@ _clear_retained_cb (struct mosquitto *mosq, void *obj, int mid)
 
   bh = (nns_edge_broker_s *) mosquitto_userdata (mosq);
 
-  if (!bh || bh->cleared)
+  if (!bh)
     return;
 
   nns_edge_lock (bh);
-  bh->cleared = true;
-  nns_edge_cond_signal (bh);
+  if (!bh->cleared && mid == bh->clear_mid) {
+    bh->cleared = true;
+    nns_edge_cond_signal (bh);
+  }
   nns_edge_unlock (bh);
 }
 
 /**
- * @brief Clear retained message.
+ * @brief Clear the retained message this handle has published.
  */
 static void
 _nns_edge_clear_retained (nns_edge_broker_s * bh)
 {
   struct mosquitto *handle;
   unsigned int wait = 0U;
+  int mret;
 
   if (!bh)
     return;
 
   handle = bh->mqtt_h;
-  if (handle) {
+  if (handle && bh->retained) {
+    /* Mosquitto holds its lock calling back, do not set it under bh->lock. */
+    mosquitto_publish_callback_set (handle, _clear_retained_cb);
+
     nns_edge_lock (bh);
     bh->cleared = false;
 
-    mosquitto_publish_callback_set (handle, _clear_retained_cb);
-    mosquitto_publish (handle, NULL, bh->topic, 0, NULL, 1, true);
+    mret = mosquitto_publish (handle, &bh->clear_mid, bh->topic, 0, NULL, 1,
+        true);
+    if (mret != MOSQ_ERR_SUCCESS) {
+      nns_edge_logw ("Failed to clear the retained message (Topic:%s).",
+          bh->topic);
+    } else {
+      /* Wait up to 10 seconds. */
+      while (!bh->cleared && ++wait < 1000U)
+        nns_edge_cond_wait_until (bh, 10);
+    }
 
-    /* Wait up to 10 seconds. */
-    while (!bh->cleared && ++wait < 1000U)
-      nns_edge_cond_wait_until (bh, 10);
-
-    mosquitto_publish_callback_set (handle, NULL);
     bh->cleared = true;
     nns_edge_unlock (bh);
+
+    mosquitto_publish_callback_set (handle, NULL);
   }
 }
 
@@ -395,6 +410,7 @@ nns_edge_mqtt_publish (nns_edge_broker_h broker_h, const void *data,
     return NNS_EDGE_ERROR_IO;
   }
 
+  bh->retained = true;
   return NNS_EDGE_ERROR_NONE;
 }
 
