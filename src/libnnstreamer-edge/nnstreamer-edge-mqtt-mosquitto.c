@@ -42,7 +42,7 @@ typedef struct
   pthread_mutex_t lock;
   pthread_cond_t cond;
   bool cleared;
-  bool retained;
+  bool retained; /**< Set by publish, read by close; never run concurrently. */
   int clear_mid;
 } nns_edge_broker_s;
 
