@@ -5924,6 +5924,7 @@ _test_get_time_ms (void)
 
 /**
  * @brief Sleep until the wall clock is 900 to 950 ms into a second.
+ * @note nns_edge_cond_wait_until() builds its deadline from the wall clock.
  */
 static void
 _test_wait_end_of_second (void)
