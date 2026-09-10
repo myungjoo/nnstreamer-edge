@@ -7478,6 +7478,387 @@ TEST (edgeTransfer, sendWithinReceiverLimit)
 }
 
 /**
+ * @brief What a query or pub/sub pair saw while transferring data at the memory limit.
+ */
+typedef struct {
+  nns_edge_h handle; /**< Node to answer through, only used by the receiving server. */
+  bool is_server;
+  unsigned int received;
+  unsigned int closed;
+  unsigned int count;
+  bool payload_ok;
+  bool meta_ok;
+} ne_test_limit_data_s;
+
+/**
+ * @brief Edge event callback that checks every memory of a data event, and answers on the server side.
+ */
+static int
+_test_limit_data_cb (nns_edge_event_h event_h, void *user_data)
+{
+  ne_test_limit_data_s *_td = (ne_test_limit_data_s *) user_data;
+  nns_edge_event_e event = NNS_EDGE_EVENT_UNKNOWN;
+  nns_edge_data_h data_h;
+  void *data;
+  char *val = NULL;
+  nns_size_t len, expected_len, j;
+  unsigned int i, count;
+  int ret;
+
+  if (!_td || nns_edge_event_get_type (event_h, &event) != NNS_EDGE_ERROR_NONE)
+    return NNS_EDGE_ERROR_NONE;
+
+  switch (event) {
+    case NNS_EDGE_EVENT_NEW_DATA_RECEIVED:
+      ret = nns_edge_event_parse_new_data (event_h, &data_h);
+      EXPECT_EQ (ret, NNS_EDGE_ERROR_NONE);
+
+      ret = nns_edge_data_get_count (data_h, &count);
+      EXPECT_EQ (ret, NNS_EDGE_ERROR_NONE);
+      _td->count = count;
+      _td->payload_ok = true;
+
+      for (i = 0; i < count; i++) {
+        if (nns_edge_data_get (data_h, i, &data, &len) != NNS_EDGE_ERROR_NONE) {
+          _td->payload_ok = false;
+          break;
+        }
+
+        expected_len = (nns_size_t) (i % 16U) + 1U;
+        if (len != expected_len) {
+          _td->payload_ok = false;
+          break;
+        }
+
+        for (j = 0; j < len; j++) {
+          if (((uint8_t *) data)[j] != _test_peer_byte (i, j)) {
+            _td->payload_ok = false;
+            break;
+          }
+        }
+      }
+
+      _td->meta_ok = (nns_edge_data_get_info (data_h, "test-meta", &val) == NNS_EDGE_ERROR_NONE
+                      && val != NULL && 0 == strcmp (val, "from-peer"));
+      SAFE_FREE (val);
+
+      if (_td->is_server) {
+        ret = nns_edge_send (_td->handle, data_h);
+        EXPECT_EQ (ret, NNS_EDGE_ERROR_NONE);
+      }
+
+      nns_edge_data_destroy (data_h);
+      _td->received++;
+      break;
+    case NNS_EDGE_EVENT_CONNECTION_CLOSED:
+      _td->closed++;
+      break;
+    default:
+      break;
+  }
+
+  return NNS_EDGE_ERROR_NONE;
+}
+
+/**
+ * @brief Fill an edge data handle with NNS_EDGE_DATA_LIMIT memories of distinct content.
+ */
+static void
+_test_fill_limit_data (nns_edge_data_h data_h)
+{
+  void *mem;
+  nns_size_t len, j;
+  unsigned int i;
+  int ret;
+
+  for (i = 0; i < NNS_EDGE_DATA_LIMIT; i++) {
+    len = (nns_size_t) (i % 16U) + 1U;
+    mem = malloc (len);
+    ASSERT_TRUE (mem != NULL);
+
+    for (j = 0; j < len; j++)
+      ((uint8_t *) mem)[j] = _test_peer_byte (i, j);
+
+    ret = nns_edge_data_add (data_h, mem, len, nns_edge_free);
+    EXPECT_EQ (ret, NNS_EDGE_ERROR_NONE);
+  }
+}
+
+/**
+ * @brief A data handle holding exactly the memory limit round-trips over a query pair.
+ */
+TEST (edgeTransfer, dataAtMemoryLimit)
+{
+  nns_edge_h server_h, client_h;
+  ne_test_limit_data_s rd_server, rd_client;
+  nns_edge_data_h data_h;
+  char *val;
+  unsigned int retry;
+  int ret, port;
+
+  memset (&rd_server, 0, sizeof (rd_server));
+  memset (&rd_client, 0, sizeof (rd_client));
+  port = nns_edge_get_available_port ();
+
+  val = nns_edge_strdup_printf ("%d", port);
+  ret = nns_edge_create_handle ("limit-mem-server", NNS_EDGE_CONNECT_TYPE_TCP,
+      NNS_EDGE_NODE_TYPE_QUERY_SERVER, &server_h);
+  ASSERT_EQ (ret, NNS_EDGE_ERROR_NONE);
+  rd_server.handle = server_h;
+  rd_server.is_server = true;
+  nns_edge_set_event_callback (server_h, _test_limit_data_cb, &rd_server);
+  nns_edge_set_info (server_h, "IP", "127.0.0.1");
+  nns_edge_set_info (server_h, "PORT", val);
+  nns_edge_set_info (server_h, "CAPS", "test server");
+  SAFE_FREE (val);
+
+  ret = nns_edge_create_handle ("limit-mem-client", NNS_EDGE_CONNECT_TYPE_TCP,
+      NNS_EDGE_NODE_TYPE_QUERY_CLIENT, &client_h);
+  ASSERT_EQ (ret, NNS_EDGE_ERROR_NONE);
+  nns_edge_set_event_callback (client_h, _test_limit_data_cb, &rd_client);
+  nns_edge_set_info (client_h, "IP", "127.0.0.1");
+  nns_edge_set_info (client_h, "CAPS", "test client");
+
+  ret = nns_edge_start (server_h);
+  EXPECT_EQ (ret, NNS_EDGE_ERROR_NONE);
+  ret = nns_edge_start (client_h);
+  EXPECT_EQ (ret, NNS_EDGE_ERROR_NONE);
+
+  usleep (200000);
+  ret = nns_edge_connect (client_h, "127.0.0.1", port);
+  EXPECT_EQ (ret, NNS_EDGE_ERROR_NONE);
+  usleep (200000);
+
+  ret = nns_edge_data_create (&data_h);
+  EXPECT_EQ (ret, NNS_EDGE_ERROR_NONE);
+  _test_fill_limit_data (data_h);
+  ret = nns_edge_data_set_info (data_h, "test-meta", "from-peer");
+  EXPECT_EQ (ret, NNS_EDGE_ERROR_NONE);
+
+  ret = nns_edge_send (client_h, data_h);
+  EXPECT_EQ (ret, NNS_EDGE_ERROR_NONE);
+
+  retry = 0U;
+  do {
+    usleep (100000);
+    if (rd_server.received > 0)
+      break;
+  } while (retry++ < 50U);
+
+  EXPECT_EQ (rd_server.received, 1U);
+  EXPECT_EQ (rd_server.closed, 0U);
+  EXPECT_EQ (rd_server.count, (unsigned int) NNS_EDGE_DATA_LIMIT);
+  EXPECT_TRUE (rd_server.payload_ok);
+  EXPECT_TRUE (rd_server.meta_ok);
+
+  retry = 0U;
+  do {
+    usleep (100000);
+    if (rd_client.received > 0)
+      break;
+  } while (retry++ < 50U);
+
+  EXPECT_EQ (rd_client.received, 1U);
+  EXPECT_EQ (rd_client.closed, 0U);
+  EXPECT_EQ (rd_client.count, (unsigned int) NNS_EDGE_DATA_LIMIT);
+  EXPECT_TRUE (rd_client.payload_ok);
+  EXPECT_TRUE (rd_client.meta_ok);
+
+  ret = nns_edge_data_destroy (data_h);
+  EXPECT_EQ (ret, NNS_EDGE_ERROR_NONE);
+  ret = nns_edge_release_handle (client_h);
+  EXPECT_EQ (ret, NNS_EDGE_ERROR_NONE);
+  ret = nns_edge_release_handle (server_h);
+  EXPECT_EQ (ret, NNS_EDGE_ERROR_NONE);
+}
+
+/**
+ * @brief The same transfer broadcasts intact from a publisher to a subscriber.
+ */
+TEST (edgeTransfer, dataAtMemoryLimitPubSub)
+{
+  nns_edge_h pub_h, sub_h;
+  ne_test_limit_data_s rd_sub;
+  nns_edge_data_h data_h;
+  char *val;
+  unsigned int retry;
+  int ret, port;
+
+  memset (&rd_sub, 0, sizeof (rd_sub));
+  port = nns_edge_get_available_port ();
+
+  val = nns_edge_strdup_printf ("%d", port);
+  ret = nns_edge_create_handle (
+      "limit-pub", NNS_EDGE_CONNECT_TYPE_TCP, NNS_EDGE_NODE_TYPE_PUB, &pub_h);
+  ASSERT_EQ (ret, NNS_EDGE_ERROR_NONE);
+  nns_edge_set_info (pub_h, "IP", "127.0.0.1");
+  nns_edge_set_info (pub_h, "PORT", val);
+  nns_edge_set_info (pub_h, "CAPS", "test pub");
+  SAFE_FREE (val);
+
+  ret = nns_edge_create_handle (
+      "limit-sub", NNS_EDGE_CONNECT_TYPE_TCP, NNS_EDGE_NODE_TYPE_SUB, &sub_h);
+  ASSERT_EQ (ret, NNS_EDGE_ERROR_NONE);
+  nns_edge_set_event_callback (sub_h, _test_limit_data_cb, &rd_sub);
+  nns_edge_set_info (sub_h, "IP", "127.0.0.1");
+  nns_edge_set_info (sub_h, "CAPS", "test sub");
+
+  ret = nns_edge_start (pub_h);
+  EXPECT_EQ (ret, NNS_EDGE_ERROR_NONE);
+  ret = nns_edge_start (sub_h);
+  EXPECT_EQ (ret, NNS_EDGE_ERROR_NONE);
+
+  usleep (200000);
+  ret = nns_edge_connect (sub_h, "127.0.0.1", port);
+  EXPECT_EQ (ret, NNS_EDGE_ERROR_NONE);
+  usleep (200000);
+
+  ret = nns_edge_data_create (&data_h);
+  EXPECT_EQ (ret, NNS_EDGE_ERROR_NONE);
+  _test_fill_limit_data (data_h);
+  ret = nns_edge_data_set_info (data_h, "test-meta", "from-peer");
+  EXPECT_EQ (ret, NNS_EDGE_ERROR_NONE);
+
+  ret = nns_edge_send (pub_h, data_h);
+  EXPECT_EQ (ret, NNS_EDGE_ERROR_NONE);
+
+  retry = 0U;
+  do {
+    usleep (100000);
+    if (rd_sub.received > 0)
+      break;
+  } while (retry++ < 50U);
+
+  EXPECT_EQ (rd_sub.received, 1U);
+  EXPECT_EQ (rd_sub.closed, 0U);
+  EXPECT_EQ (rd_sub.count, (unsigned int) NNS_EDGE_DATA_LIMIT);
+  EXPECT_TRUE (rd_sub.payload_ok);
+  EXPECT_TRUE (rd_sub.meta_ok);
+
+  ret = nns_edge_data_destroy (data_h);
+  EXPECT_EQ (ret, NNS_EDGE_ERROR_NONE);
+  ret = nns_edge_release_handle (sub_h);
+  EXPECT_EQ (ret, NNS_EDGE_ERROR_NONE);
+  ret = nns_edge_release_handle (pub_h);
+  EXPECT_EQ (ret, NNS_EDGE_ERROR_NONE);
+}
+
+/**
+ * @brief One memory over the limit is refused, pinning the bound that keeps cmd->mem[] in range.
+ */
+TEST (edgeTransfer, dataOverMemoryLimit_n)
+{
+  ne_test_peer_s peer;
+  ne_test_recv_s rd;
+  nns_edge_h edge_h;
+  int ret;
+
+  memset (&peer, 0, sizeof (peer));
+  memset (&rd, 0, sizeof (rd));
+  peer.port = nns_edge_get_available_port ();
+  peer.send_data = true;
+  peer.num = NNS_EDGE_DATA_LIMIT + 1;
+  ASSERT_TRUE (_test_peer_start (&peer));
+
+  edge_h = _test_sub_create ("sub-mem-over", &rd, NULL);
+  ASSERT_TRUE (edge_h != NULL);
+
+  ret = nns_edge_start (edge_h);
+  EXPECT_EQ (ret, NNS_EDGE_ERROR_NONE);
+  ret = nns_edge_connect (edge_h, "127.0.0.1", peer.port);
+  EXPECT_EQ (ret, NNS_EDGE_ERROR_NONE);
+
+  _test_wait_event (&rd);
+
+  EXPECT_EQ (rd.received, 0U);
+  EXPECT_EQ (rd.closed, 1U);
+
+  _test_peer_stop (&peer);
+  EXPECT_TRUE (peer.sent_data);
+
+  ret = nns_edge_release_handle (edge_h);
+  EXPECT_EQ (ret, NNS_EDGE_ERROR_NONE);
+
+  SAFE_FREE (rd.meta_value);
+}
+
+/**
+ * @brief Accepting the memory limit does not relax the byte-size limit of the receiver.
+ */
+TEST (edgeTransfer, dataAtMemoryLimitOverSize_n)
+{
+  nns_edge_h server_h, client_h;
+  ne_test_recv_s rd_server, rd_client;
+  nns_edge_data_h data_h;
+  void *data;
+  char *val;
+  unsigned int i;
+  int ret, port;
+
+  memset (&rd_server, 0, sizeof (rd_server));
+  memset (&rd_client, 0, sizeof (rd_client));
+  port = nns_edge_get_available_port ();
+
+  val = nns_edge_strdup_printf ("%d", port);
+  ret = nns_edge_create_handle ("limit-size-server", NNS_EDGE_CONNECT_TYPE_TCP,
+      NNS_EDGE_NODE_TYPE_QUERY_SERVER, &server_h);
+  ASSERT_EQ (ret, NNS_EDGE_ERROR_NONE);
+  nns_edge_set_event_callback (server_h, _test_recv_event_cb, &rd_server);
+  nns_edge_set_info (server_h, "IP", "127.0.0.1");
+  nns_edge_set_info (server_h, "PORT", val);
+  nns_edge_set_info (server_h, "CAPS", "test server");
+  ret = nns_edge_set_info (server_h, "MAX_TRANSFER_SIZE", "1024");
+  EXPECT_EQ (ret, NNS_EDGE_ERROR_NONE);
+  SAFE_FREE (val);
+
+  ret = nns_edge_create_handle ("limit-size-client", NNS_EDGE_CONNECT_TYPE_TCP,
+      NNS_EDGE_NODE_TYPE_QUERY_CLIENT, &client_h);
+  ASSERT_EQ (ret, NNS_EDGE_ERROR_NONE);
+  nns_edge_set_event_callback (client_h, _test_recv_event_cb, &rd_client);
+  nns_edge_set_info (client_h, "IP", "127.0.0.1");
+  nns_edge_set_info (client_h, "CAPS", "test client");
+
+  ret = nns_edge_start (server_h);
+  EXPECT_EQ (ret, NNS_EDGE_ERROR_NONE);
+  ret = nns_edge_start (client_h);
+  EXPECT_EQ (ret, NNS_EDGE_ERROR_NONE);
+
+  usleep (200000);
+  ret = nns_edge_connect (client_h, "127.0.0.1", port);
+  EXPECT_EQ (ret, NNS_EDGE_ERROR_NONE);
+  usleep (200000);
+
+  ret = nns_edge_data_create (&data_h);
+  EXPECT_EQ (ret, NNS_EDGE_ERROR_NONE);
+
+  for (i = 0; i < NNS_EDGE_DATA_LIMIT; i++) {
+    data = calloc (1, 16U);
+    ASSERT_TRUE (data != NULL);
+    ret = nns_edge_data_add (data_h, data, 16U, nns_edge_free);
+    EXPECT_EQ (ret, NNS_EDGE_ERROR_NONE);
+  }
+
+  /* The sender is not limited, so the send itself succeeds. */
+  ret = nns_edge_send (client_h, data_h);
+  EXPECT_EQ (ret, NNS_EDGE_ERROR_NONE);
+
+  _test_wait_event (&rd_server);
+
+  EXPECT_EQ (rd_server.received, 0U);
+  EXPECT_EQ (rd_server.closed, 1U);
+
+  ret = nns_edge_data_destroy (data_h);
+  EXPECT_EQ (ret, NNS_EDGE_ERROR_NONE);
+  ret = nns_edge_release_handle (client_h);
+  EXPECT_EQ (ret, NNS_EDGE_ERROR_NONE);
+  ret = nns_edge_release_handle (server_h);
+  EXPECT_EQ (ret, NNS_EDGE_ERROR_NONE);
+
+  SAFE_FREE (rd_server.meta_value);
+  SAFE_FREE (rd_client.meta_value);
+}
+
+/**
  * @brief A node that announces a transfer and then goes quiet loses the connection.
  */
 TEST (edgeTransfer, recvTimeoutOnSilentPeer_n)

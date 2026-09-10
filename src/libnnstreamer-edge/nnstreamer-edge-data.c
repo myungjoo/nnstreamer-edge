@@ -703,7 +703,7 @@ nns_edge_data_is_serialized (const void *data, const nns_size_t data_len)
 
   /**
    * @todo The number of memories in data.
-   * Total number of memories in edge-data should be less than NNS_EDGE_DATA_LIMIT.
+   * Total number of memories in edge-data should not exceed NNS_EDGE_DATA_LIMIT.
    * Fetch nns-edge version info and check allowed memories if NNS_EDGE_DATA_LIMIT is updated.
    */
   if (header->num_mem > NNS_EDGE_DATA_LIMIT) {

@@ -435,11 +435,14 @@ _nns_edge_cmd_is_valid (nns_edge_cmd_s * cmd)
 
   /**
    * @todo The number of memories in data.
-   * Total number of memories in edge-data should be less than NNS_EDGE_DATA_LIMIT.
+   * Total number of memories in edge-data should not exceed NNS_EDGE_DATA_LIMIT.
    * Fetch nns-edge version info and check allowed memories if NNS_EDGE_DATA_LIMIT is updated.
    */
-  if (cmd->info.num > NNS_EDGE_DATA_LIMIT)
+  if (cmd->info.num > NNS_EDGE_DATA_LIMIT) {
+    nns_edge_loge ("Invalid command, the max memories for data transfer is %d.",
+        NNS_EDGE_DATA_LIMIT);
     return false;
+  }
 
   return true;
 }
@@ -586,11 +589,6 @@ _nns_edge_cmd_receive (nns_edge_conn_s * conn, nns_edge_cmd_s * cmd)
   }
 
   nns_edge_logd ("Received command:%d (num:%u)", cmd->info.cmd, cmd->info.num);
-  if (cmd->info.num >= NNS_EDGE_DATA_LIMIT) {
-    nns_edge_loge ("Invalid request, the max memories for data transfer is %d.",
-        NNS_EDGE_DATA_LIMIT);
-    return NNS_EDGE_ERROR_IO;
-  }
 
   if (!_nns_edge_cmd_size_is_valid (cmd, conn->max_transfer_size)) {
     nns_edge_loge
