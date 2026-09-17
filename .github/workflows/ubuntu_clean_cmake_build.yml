@@ -59,6 +59,28 @@ jobs:
         ASAN_OPTIONS: detect_leaks=1
       run: ctest --output-on-failure --no-tests=error
 
+    # ThreadSanitizer over the concurrency test, in this job for the same reason
+    # as AddressSanitizer above. Any report makes the binary exit non-zero, so a
+    # flag or field shared between the library threads without a lock or an
+    # atomic type fails the check. The runner kernel randomizes mmap with more
+    # bits than TSan supports, so reduce them first.
+    - name: Configure CMake with ThreadSanitizer
+      run: >
+        cmake -B ${{github.workspace}}/build-tsan -DCMAKE_BUILD_TYPE=Debug -DENABLE_TEST=ON
+        -DCMAKE_C_FLAGS="-fsanitize=thread -fno-omit-frame-pointer"
+        -DCMAKE_CXX_FLAGS="-fsanitize=thread -fno-omit-frame-pointer"
+        -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=thread"
+        -DCMAKE_SHARED_LINKER_FLAGS="-fsanitize=thread"
+
+    - name: Build with ThreadSanitizer
+      run: cmake --build ${{github.workspace}}/build-tsan --target unittest_nnstreamer-edge-thread
+
+    - name: Test with ThreadSanitizer
+      working-directory: ${{github.workspace}}/build-tsan
+      run: |
+        sudo sysctl -w vm.mmap_rnd_bits=28
+        ctest -R '^unittest_nnstreamer-edge-thread$' --output-on-failure --no-tests=error
+
   build-ubuntu-26-04:
     # Ubuntu 26.04 ships gcc 15, which compiles C as C23 by default. There
     # string.h keeps the constness of the argument of strchr() and strstr(),
