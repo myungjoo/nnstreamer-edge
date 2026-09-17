@@ -292,6 +292,7 @@ nns_edge_queue_wait_pop (nns_edge_queue_h handle, unsigned int timeout,
     void **data, nns_size_t * size)
 {
   nns_edge_queue_s *q = (nns_edge_queue_s *) handle;
+  struct timespec deadline;
   bool popped = false;
 
   if (!nns_edge_handle_is_valid (q)) {
@@ -313,9 +314,16 @@ nns_edge_queue_wait_pop (nns_edge_queue_h handle, unsigned int timeout,
   *data = NULL;
   *size = 0U;
 
+  if (timeout > 0U)
+    nns_edge_get_deadline (timeout, &deadline);
+
   nns_edge_lock (q);
-  if (q->length == 0U && !q->stopped)
-    nns_edge_cond_wait_until (q, timeout);
+  while (q->length == 0U && !q->stopped) {
+    if (timeout == 0U)
+      nns_edge_cond_wait (q);
+    else if (pthread_cond_timedwait (&q->cond, &q->lock, &deadline) != 0)
+      break;
+  }
 
   popped = _pop_data (q, false, data, size);
   nns_edge_unlock (q);
