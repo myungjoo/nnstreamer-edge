@@ -455,6 +455,7 @@ TEST (edgeThread, disconnectBeforeThreadRuns)
 
 /**
  * @brief Release the handle right after nns_edge_start(), before the listener and send threads may have run.
+ * @note This covers the start-up order, not the lost start-up wait itself, which needs a spurious wake-up to reproduce.
  */
 TEST (edgeThread, releaseRightAfterStart)
 {
@@ -588,6 +589,7 @@ TEST (edgeThread, sendNoConnection_n)
 
 /**
  * @brief Send right after start and connect, before the send thread may have run.
+ * @note This covers the start-up order, not the lost start-up wait itself, which needs a spurious wake-up to reproduce.
  */
 TEST (edgeThread, sendImmediatelyAfterConnect)
 {
