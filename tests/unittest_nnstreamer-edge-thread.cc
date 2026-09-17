@@ -8,13 +8,61 @@
  */
 
 #include <gtest/gtest.h>
+#include <arpa/inet.h>
 #include <atomic>
+#include <cstdarg>
+#include <cstdio>
+#include <cstring>
+#include <sys/socket.h>
 #include <thread>
 #include "nnstreamer-edge-data.h"
 #include "nnstreamer-edge-event.h"
 #include "nnstreamer-edge-log.h"
 #include "nnstreamer-edge-util.h"
 #include "nnstreamer-edge.h"
+
+#if !defined(__TIZEN__) && !defined(__ANDROID__)
+/**
+ * @brief Hold the thread that logs the error command sent before closing a socket.
+ */
+static std::atomic<bool> test_hold_close_socket (false);
+
+/**
+ * @brief Set while the thread closing a socket is held.
+ */
+static std::atomic<bool> test_close_socket_held (false);
+
+/**
+ * @brief Set once the held thread goes on.
+ */
+static std::atomic<bool> test_close_socket_resumed (false);
+
+/**
+ * @brief nns_edge_print_log() replacement that holds the thread closing a socket on demand.
+ * @note This shadows the definition in the library for the whole process. The
+ *       library logs the message below right before it closes the socket of a
+ *       connection, which a message thread does after taking its connection
+ *       data out of the handle and before holding it in the closed list.
+ */
+extern "C" void
+nns_edge_print_log (nns_edge_log_level_e level, const char *fmt, ...)
+{
+  va_list args;
+
+  va_start (args, fmt);
+  fprintf (stderr, "[%d][nnstreamer-edge] ", (int) level);
+  vfprintf (stderr, fmt, args);
+  fprintf (stderr, "\n");
+  va_end (args);
+
+  if (strcmp (fmt, "Send error cmd to close connection.") == 0
+      && test_hold_close_socket.exchange (false)) {
+    test_close_socket_held.store (true);
+    usleep (300000);
+    test_close_socket_resumed.store (true);
+  }
+}
+#endif
 
 /**
  * @brief Data struct for the concurrency unittest.
@@ -563,6 +611,64 @@ TEST (edgeThread, sendNoConnection_n)
 
   nns_edge_data_destroy (data_h);
   EXPECT_EQ (nns_edge_release_handle (server_h), NNS_EDGE_ERROR_NONE);
+}
+
+/**
+ * @brief Release the handle while a message thread is removing its connection.
+ * @details The message thread of a connection lost by the peer takes the
+ * connection data out of the handle and then holds it in the list of closed
+ * connections. A release in between saw neither, freed the handle, and the
+ * message thread used the freed handle.
+ */
+TEST (edgeThread, releaseWhileRemovingConnection)
+{
+#if defined(__TIZEN__) || defined(__ANDROID__)
+  GTEST_SKIP () << "The test holds the message thread through nns_edge_print_log().";
+#else
+  ne_thread_test_data_s td = {};
+  struct sockaddr_in saddr = {};
+  nns_edge_h edge_h;
+  unsigned int retry;
+  int port, sockfd;
+
+  port = nns_edge_get_available_port ();
+  edge_h = _start_test_server ("removing-node", port, &td, NNS_EDGE_NODE_TYPE_QUERY_CLIENT);
+  ASSERT_TRUE (edge_h != NULL);
+
+  /* A raw peer of a query client gets a message thread without a handshake. */
+  sockfd = socket (AF_INET, SOCK_STREAM, 0);
+  ASSERT_GE (sockfd, 0);
+  saddr.sin_family = AF_INET;
+  saddr.sin_addr.s_addr = inet_addr ("127.0.0.1");
+  saddr.sin_port = htons (port);
+  ASSERT_EQ (connect (sockfd, (struct sockaddr *) &saddr, sizeof (saddr)), 0);
+
+  for (retry = 0U; retry < 200U && td.connected.load () == 0U; retry++)
+    usleep (10000);
+  ASSERT_EQ (td.connected.load (), 1U);
+
+  test_close_socket_held.store (false);
+  test_close_socket_resumed.store (false);
+  test_hold_close_socket.store (true);
+
+  /* The message thread loses the peer and removes the connection. */
+  close (sockfd);
+
+  for (retry = 0U; retry < 200U && !test_close_socket_held.load (); retry++)
+    usleep (10000);
+  test_hold_close_socket.store (false);
+  ASSERT_TRUE (test_close_socket_held.load ());
+
+  EXPECT_EQ (nns_edge_release_handle (edge_h), NNS_EDGE_ERROR_NONE);
+
+  /* The release should have waited for the message thread. */
+  EXPECT_TRUE (test_close_socket_resumed.load ());
+
+  /* Give a message thread that outlived the release the time to use the handle. */
+  for (retry = 0U; retry < 100U && !test_close_socket_resumed.load (); retry++)
+    usleep (10000);
+  usleep (100000);
+#endif
 }
 
 /**

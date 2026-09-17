@@ -94,6 +94,7 @@ typedef struct
   /* list of connection data */
   pthread_mutex_t conn_lock;
   void *connections;
+  unsigned int detached; /**< Connection data taken out of the list and not held yet, under the connection lock. */
 
   /* list of connection data waiting for its message thread to be terminated */
   void *closed_connections;
@@ -1002,6 +1003,7 @@ _nns_edge_remove_connection (nns_edge_handle_s * eh, int64_t client_id)
         prev->next = cdata->next;
       else
         eh->connections = cdata->next;
+      eh->detached++;
       break;
     }
     prev = cdata;
@@ -1011,12 +1013,17 @@ _nns_edge_remove_connection (nns_edge_handle_s * eh, int64_t client_id)
   nns_edge_conn_unlock (eh);
 
   /* The caller may be the message thread of this connection, release it later. */
-  if (cdata)
+  if (cdata) {
     _nns_edge_hold_closed_connection (eh, cdata);
+
+    nns_edge_conn_lock (eh);
+    eh->detached--;
+    nns_edge_conn_unlock (eh);
+  }
 }
 
 /**
- * @brief Check whether the handle has a connection left.
+ * @brief Check whether the handle has a connection left, including one being taken out of the list.
  * @note This function takes the connection lock, do not call it with the lock held.
  */
 static bool
@@ -1025,7 +1032,7 @@ _nns_edge_has_connection (nns_edge_handle_s * eh)
   bool remained;
 
   nns_edge_conn_lock (eh);
-  remained = (eh->connections != NULL);
+  remained = (eh->connections != NULL || eh->detached > 0U);
   nns_edge_conn_unlock (eh);
 
   return remained;
@@ -2224,9 +2231,14 @@ nns_edge_release_handle (nns_edge_h edge_h)
   }
 
   /* A message thread being joined may connect again, drain until it cannot. */
-  do {
+  _nns_edge_remove_all_connection (eh);
+  while (_nns_edge_has_connection (eh)) {
+    /* A message thread may be holding the connection data it has just removed. */
+    struct timespec delay = { 0, 1000000 };
+
+    nanosleep (&delay, NULL);
     _nns_edge_remove_all_connection (eh);
-  } while (_nns_edge_has_connection (eh));
+  }
 
   pthread_mutex_lock (&eh->closed_lock);
   if (eh->closed_connections) {
