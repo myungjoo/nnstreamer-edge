@@ -70,7 +70,6 @@ typedef struct
 {
   uint32_t magic;
   pthread_mutex_t lock;
-  pthread_cond_t cond;
   char *id;
   char *topic;
   nns_edge_connect_type_e connect_type;
@@ -1863,7 +1862,6 @@ _nns_edge_create_handle (const char *id, nns_edge_node_type_e node_type,
 
   nns_edge_lock_init (eh);
   nns_edge_conn_lock_init (eh);
-  nns_edge_cond_init (eh);
   pthread_mutex_init (&eh->closed_lock, NULL);
   nns_edge_handle_set_magic (eh, NNS_EDGE_MAGIC);
   eh->id = STR_IS_VALID (id) ? nns_edge_strdup (id) :
@@ -2257,7 +2255,6 @@ nns_edge_release_handle (nns_edge_h edge_h)
   SAFE_FREE (eh->caps_str);
 
   nns_edge_unlock (eh);
-  nns_edge_cond_destroy (eh);
   nns_edge_lock_destroy (eh);
   pthread_mutex_destroy (&eh->closed_lock);
   nns_edge_conn_lock_destroy (eh);
