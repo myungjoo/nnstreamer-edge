@@ -2187,6 +2187,7 @@ done:
 int
 nns_edge_release_handle (nns_edge_h edge_h)
 {
+  const struct timespec drain_delay = { 0, 1000000 };
   nns_edge_handle_s *eh;
 
   eh = (nns_edge_handle_s *) edge_h;
@@ -2234,9 +2235,7 @@ nns_edge_release_handle (nns_edge_h edge_h)
   _nns_edge_remove_all_connection (eh);
   while (_nns_edge_has_connection (eh)) {
     /* A message thread may be holding the connection data it has just removed. */
-    struct timespec delay = { 0, 1000000 };
-
-    nanosleep (&delay, NULL);
+    nanosleep (&drain_delay, NULL);
     _nns_edge_remove_all_connection (eh);
   }
 
