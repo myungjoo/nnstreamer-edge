@@ -936,6 +936,31 @@ _nns_edge_release_closed_connection (nns_edge_handle_s * eh)
 }
 
 /**
+ * @brief Check whether a connection data of another thread waits to be released.
+ * @note This function takes the lock of the closed connections, do not call it
+ *       with the lock held. The connection data of the calling thread is not
+ *       counted, no thread can join itself and it would never be released.
+ */
+static bool
+_nns_edge_has_closed_connection (nns_edge_handle_s * eh)
+{
+  nns_edge_conn_data_s *cdata;
+  bool remained = false;
+
+  pthread_mutex_lock (&eh->closed_lock);
+  for (cdata = (nns_edge_conn_data_s *) eh->closed_connections; cdata;
+      cdata = cdata->next) {
+    if (!_nns_edge_conn_data_is_self (cdata)) {
+      remained = true;
+      break;
+    }
+  }
+  pthread_mutex_unlock (&eh->closed_lock);
+
+  return remained;
+}
+
+/**
  * @brief Get nnstreamer-edge connection data.
  * @note This function should be called with connection lock.
  */
@@ -1041,6 +1066,10 @@ _nns_edge_has_connection (nns_edge_handle_s * eh)
 /**
  * @brief Remove all connection data.
  * @note This function takes the connection lock, do not call it with the lock held.
+ * @note The connection data is on neither list while it is held, as it is in
+ *       _nns_edge_remove_connection(). It needs no count of its own because
+ *       every caller runs with the handle lock held, so the thread that frees
+ *       the handle is the one running this.
  */
 static void
 _nns_edge_remove_all_connection (nns_edge_handle_s * eh)
@@ -2231,10 +2260,15 @@ nns_edge_release_handle (nns_edge_h edge_h)
     eh->listener_fd = -1;
   }
 
-  /* A message thread being joined may connect again, drain until it cannot. */
+  /**
+   * A message thread being joined may connect again, drain until it cannot.
+   * A message thread removing its connection is waited for as well: it raises
+   * the count of the handle before taking the connection data out and lowers it
+   * after the data is on the closed list, so either the count or the list holds
+   * it at every moment in between.
+   */
   _nns_edge_remove_all_connection (eh);
-  while (_nns_edge_has_connection (eh)) {
-    /* A message thread may be holding the connection data it has just removed. */
+  while (_nns_edge_has_connection (eh) || _nns_edge_has_closed_connection (eh)) {
     nanosleep (&drain_delay, NULL);
     _nns_edge_remove_all_connection (eh);
   }

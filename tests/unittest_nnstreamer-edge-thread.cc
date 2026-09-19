@@ -23,42 +23,92 @@
 
 #if !defined(__TIZEN__) && !defined(__ANDROID__)
 /**
- * @brief Hold the thread that logs the error command sent before closing a socket.
+ * @brief The message the library logs from the window the tests below drive.
+ */
+#define TEST_CLOSE_SOCKET_LOG "Send error cmd to close connection."
+
+/**
+ * @brief The message the library logs when it frees a handle it could not drain.
+ */
+#define TEST_STRANDED_LOG "Cannot release the connection of the calling thread, the handle is freed while its message thread runs."
+
+/**
+ * @brief The thread running the test, which is never held by the log below.
+ */
+static std::atomic<pthread_t> test_main_thread;
+
+/**
+ * @brief Hold the next message thread closing a socket for a while.
  */
 static std::atomic<bool> test_hold_close_socket (false);
 
 /**
- * @brief Set while the thread closing a socket is held.
+ * @brief Park the next message thread closing a socket until it is let go.
+ */
+static std::atomic<bool> test_park_close_socket (false);
+
+/**
+ * @brief Let the parked message thread go.
+ */
+static std::atomic<bool> test_unpark_close_socket (false);
+
+/**
+ * @brief Set while a message thread closing a socket is held or parked.
  */
 static std::atomic<bool> test_close_socket_held (false);
 
 /**
- * @brief Set once the held thread goes on.
+ * @brief Set once the held message thread goes on.
  */
 static std::atomic<bool> test_close_socket_resumed (false);
 
 /**
+ * @brief Set while the test releases the handle of the listening node.
+ */
+static std::atomic<bool> test_release_started (false);
+
+/**
+ * @brief Counts the handles released while a message thread of their own ran.
+ */
+static std::atomic<unsigned int> test_stranded_connections (0U);
+
+/**
  * @brief nns_edge_print_log() replacement that holds the thread closing a socket on demand.
  * @note This shadows the definition in the library for the whole process. The
- *       library logs the message below right before it closes the socket of a
- *       connection, which a message thread does after taking its connection
- *       data out of the handle and before holding it in the closed list.
+ *       library logs TEST_CLOSE_SOCKET_LOG right before it closes the socket of
+ *       a connection, which a message thread does after taking its connection
+ *       data out of the handle and before holding it in the closed list. The
+ *       thread running the test closes sockets as well and is never held.
  */
 extern "C" void
 nns_edge_print_log (nns_edge_log_level_e level, const char *fmt, ...)
 {
+  const char *level_str[] = { "DEBUG", "INFO", "WARNING", "ERROR", "FATAL", "NONE" };
   va_list args;
 
   va_start (args, fmt);
-  fprintf (stderr, "[%d][nnstreamer-edge] ", (int) level);
-  vfprintf (stderr, fmt, args);
-  fprintf (stderr, "\n");
+  printf ("[%s][nnstreamer-edge] ", level_str[level]);
+  vprintf (fmt, args);
+  printf ("\n");
   va_end (args);
 
-  if (strcmp (fmt, "Send error cmd to close connection.") == 0
-      && test_hold_close_socket.exchange (false)) {
+  if (strcmp (fmt, TEST_STRANDED_LOG) == 0)
+    test_stranded_connections++;
+
+  if (strcmp (fmt, TEST_CLOSE_SOCKET_LOG) != 0
+      || pthread_equal (pthread_self (), test_main_thread.load ()) != 0)
+    return;
+
+  if (test_hold_close_socket.exchange (false)) {
     test_close_socket_held.store (true);
     usleep (300000);
+    test_close_socket_resumed.store (true);
+  } else if (test_park_close_socket.exchange (false)) {
+    unsigned int retry;
+
+    test_close_socket_held.store (true);
+    for (retry = 0U; retry < 1000U && !test_unpark_close_socket.load (); retry++)
+      usleep (10000);
     test_close_socket_resumed.store (true);
   }
 }
@@ -71,6 +121,8 @@ typedef struct {
   nns_edge_h handle;
   std::atomic<unsigned int> received;
   std::atomic<unsigned int> connected;
+  std::atomic<bool> hold_closed_event;
+  std::atomic<bool> closed_event_held;
 } ne_thread_test_data_s;
 
 /**
@@ -98,6 +150,25 @@ _thread_test_event_cb (nns_edge_event_h event_h, void *user_data)
       break;
     case NNS_EDGE_EVENT_CONNECTION_COMPLETED:
       _td->connected++;
+      break;
+    case NNS_EDGE_EVENT_CONNECTION_CLOSED:
+      /* Keep the message thread of one peer inside the join of the release. */
+      if (_td->hold_closed_event.exchange (false)) {
+        unsigned int retry;
+
+        _td->closed_event_held.store (true);
+        for (retry = 0U; retry < 500U && !test_release_started.load (); retry++)
+          usleep (10000);
+
+        /**
+         * The release is on its way to the drain and to the join of this
+         * thread. Give it the time to get there and to take the closed list,
+         * then let the parked thread put its connection data on that list.
+         */
+        usleep (300000);
+        test_unpark_close_socket.store (true);
+        usleep (200000);
+      }
       break;
     default:
       break;
@@ -631,40 +702,126 @@ TEST (edgeThread, releaseWhileRemovingConnection)
   unsigned int retry;
   int port, sockfd;
 
+  test_main_thread.store (pthread_self ());
   port = nns_edge_get_available_port ();
   edge_h = _start_test_server ("removing-node", port, &td, NNS_EDGE_NODE_TYPE_QUERY_CLIENT);
   ASSERT_TRUE (edge_h != NULL);
 
   /* A raw peer of a query client gets a message thread without a handshake. */
   sockfd = socket (AF_INET, SOCK_STREAM, 0);
-  ASSERT_GE (sockfd, 0);
+  EXPECT_GE (sockfd, 0);
   saddr.sin_family = AF_INET;
   saddr.sin_addr.s_addr = inet_addr ("127.0.0.1");
   saddr.sin_port = htons (port);
-  ASSERT_EQ (connect (sockfd, (struct sockaddr *) &saddr, sizeof (saddr)), 0);
 
-  for (retry = 0U; retry < 200U && td.connected.load () == 0U; retry++)
-    usleep (10000);
-  ASSERT_EQ (td.connected.load (), 1U);
+  if (sockfd >= 0 && connect (sockfd, (struct sockaddr *) &saddr, sizeof (saddr)) == 0) {
+    for (retry = 0U; retry < 200U && td.connected.load () == 0U; retry++)
+      usleep (10000);
+    EXPECT_EQ (td.connected.load (), 1U);
 
-  test_close_socket_held.store (false);
-  test_close_socket_resumed.store (false);
-  test_hold_close_socket.store (true);
+    test_close_socket_held.store (false);
+    test_close_socket_resumed.store (false);
+    test_hold_close_socket.store (true);
 
-  /* The message thread loses the peer and removes the connection. */
-  close (sockfd);
+    /* The message thread loses the peer and removes the connection. */
+    close (sockfd);
 
-  for (retry = 0U; retry < 200U && !test_close_socket_held.load (); retry++)
-    usleep (10000);
-  test_hold_close_socket.store (false);
-  ASSERT_TRUE (test_close_socket_held.load ());
+    for (retry = 0U; retry < 200U && !test_close_socket_held.load (); retry++)
+      usleep (10000);
+    test_hold_close_socket.store (false);
+    EXPECT_TRUE (test_close_socket_held.load ());
+  } else {
+    ADD_FAILURE () << "Failed to connect to the node.";
+    if (sockfd >= 0)
+      close (sockfd);
+  }
 
   EXPECT_EQ (nns_edge_release_handle (edge_h), NNS_EDGE_ERROR_NONE);
 
   /* The release should have waited for the message thread. */
   EXPECT_TRUE (test_close_socket_resumed.load ());
 
-  /* Give a message thread that outlived the release the time to use the handle. */
+  /**
+   * The expectation above has already failed if the release did not wait. Give
+   * the message thread that outlived it the time to use the freed handle, so
+   * that AddressSanitizer reports where it does.
+   */
+  for (retry = 0U; retry < 100U && !test_close_socket_resumed.load (); retry++)
+    usleep (10000);
+  usleep (100000);
+#endif
+}
+
+/**
+ * @brief Release the handle while a message thread parks its connection data.
+ * @details The release drains the closed connections and then looks at the
+ * handle again. A message thread that parks its connection data in between is
+ * visible in neither look, so the release freed the handle without joining it.
+ * One peer parks its data while the release is inside the join of another.
+ */
+TEST (edgeThread, releaseWhileParkingConnection)
+{
+#if defined(__TIZEN__) || defined(__ANDROID__)
+  GTEST_SKIP () << "The test holds the message thread through nns_edge_print_log().";
+#else
+  ne_thread_test_data_s server_td = {};
+  ne_thread_test_data_s first_td = {};
+  ne_thread_test_data_s second_td = {};
+  nns_edge_h server_h, first_h, second_h;
+  unsigned int retry;
+  int port;
+
+  test_main_thread.store (pthread_self ());
+  port = nns_edge_get_available_port ();
+  server_h = _start_test_server ("parking-server", port, &server_td);
+  ASSERT_TRUE (server_h != NULL);
+
+  first_h = _start_test_client ("parking-client-1", port, &first_td);
+  second_h = _start_test_client ("parking-client-2", port, &second_td);
+  EXPECT_TRUE (first_h != NULL);
+  EXPECT_TRUE (second_h != NULL);
+
+  for (retry = 0U; retry < 200U && server_td.connected.load () < 2U; retry++)
+    usleep (10000);
+  EXPECT_EQ (server_td.connected.load (), 2U);
+
+  test_close_socket_held.store (false);
+  test_close_socket_resumed.store (false);
+  test_unpark_close_socket.store (false);
+  test_stranded_connections.store (0U);
+
+  /**
+   * Of the two message threads of the server, one parks in the log of the
+   * socket it closes, before it puts its connection data on the closed list.
+   * The other one gets that far and is then held in the event of the lost
+   * connection, which is where the release joins it.
+   */
+  test_park_close_socket.store (true);
+  server_td.hold_closed_event.store (true);
+
+  if (first_h)
+    EXPECT_EQ (nns_edge_release_handle (first_h), NNS_EDGE_ERROR_NONE);
+  if (second_h)
+    EXPECT_EQ (nns_edge_release_handle (second_h), NNS_EDGE_ERROR_NONE);
+
+  for (retry = 0U; retry < 200U
+      && !(test_close_socket_held.load () && server_td.closed_event_held.load ());
+      retry++)
+    usleep (10000);
+  test_park_close_socket.store (false);
+  server_td.hold_closed_event.store (false);
+  EXPECT_TRUE (test_close_socket_held.load ());
+  EXPECT_TRUE (server_td.closed_event_held.load ());
+
+  /* The held thread lets the parked one go once this release is under way. */
+  test_release_started.store (true);
+  EXPECT_EQ (nns_edge_release_handle (server_h), NNS_EDGE_ERROR_NONE);
+  test_release_started.store (false);
+
+  /* The parked thread should have been joined rather than left behind. */
+  EXPECT_TRUE (test_close_socket_resumed.load ());
+  EXPECT_EQ (test_stranded_connections.load (), 0U);
+
   for (retry = 0U; retry < 100U && !test_close_socket_resumed.load (); retry++)
     usleep (10000);
   usleep (100000);
