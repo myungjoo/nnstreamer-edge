@@ -30,7 +30,8 @@
 /**
  * @brief The message the library logs when it frees a handle it could not drain.
  */
-#define TEST_STRANDED_LOG "Cannot release the connection of the calling thread, the handle is freed while its message thread runs."
+#define TEST_STRANDED_LOG \
+  "Cannot release the connection of the calling thread, the handle is freed while its message thread runs."
 
 /**
  * @brief The thread running the test, which is never held by the log below.
@@ -804,9 +805,10 @@ TEST (edgeThread, releaseWhileParkingConnection)
   if (second_h)
     EXPECT_EQ (nns_edge_release_handle (second_h), NNS_EDGE_ERROR_NONE);
 
-  for (retry = 0U; retry < 200U
-      && !(test_close_socket_held.load () && server_td.closed_event_held.load ());
-      retry++)
+  for (retry = 0U;
+       retry < 200U
+       && !(test_close_socket_held.load () && server_td.closed_event_held.load ());
+       retry++)
     usleep (10000);
   test_park_close_socket.store (false);
   server_td.hold_closed_event.store (false);
