@@ -153,6 +153,7 @@ _thread_test_event_cb (nns_edge_event_h event_h, void *user_data)
       _td->connected++;
       break;
     case NNS_EDGE_EVENT_CONNECTION_CLOSED:
+#if !defined(__TIZEN__) && !defined(__ANDROID__)
       /* Keep the message thread of one peer inside the join of the release. */
       if (_td->hold_closed_event.exchange (false)) {
         unsigned int retry;
@@ -170,6 +171,7 @@ _thread_test_event_cb (nns_edge_event_h event_h, void *user_data)
         test_unpark_close_socket.store (true);
         usleep (200000);
       }
+#endif
       break;
     default:
       break;
