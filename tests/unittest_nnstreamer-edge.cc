@@ -7159,6 +7159,148 @@ TEST (edgeTransfer, defaultLimitAcceptsLargeData)
 }
 
 /**
+ * @brief A size no receiver could allocate is not allocated up front, the node waits for the bytes.
+ * @details Allocating the announced size at once fails, which closes the connection at once.
+ */
+TEST (edgeTransfer, announcedSizeNotAllocatedUpfront)
+{
+  ne_test_peer_s peer;
+  ne_test_recv_s rd;
+  nns_edge_h edge_h;
+  int ret;
+
+  memset (&peer, 0, sizeof (peer));
+  memset (&rd, 0, sizeof (rd));
+  peer.port = nns_edge_get_available_port ();
+  peer.send_data = true;
+  peer.num = 1U;
+  peer.mem_size[0] = 1ULL << 62;
+  peer.mem_actual[0] = 16U;
+  ASSERT_TRUE (_test_peer_start (&peer));
+
+  edge_h = _test_sub_create ("sub-huge-announce", &rd, NULL);
+  ASSERT_TRUE (edge_h != NULL);
+
+  ret = nns_edge_start (edge_h);
+  EXPECT_EQ (ret, NNS_EDGE_ERROR_NONE);
+  ret = nns_edge_connect (edge_h, "127.0.0.1", peer.port);
+  EXPECT_EQ (ret, NNS_EDGE_ERROR_NONE);
+
+  /* Well within the default receive timeout, so the connection is still waiting for data. */
+  usleep (1000000);
+  EXPECT_EQ (rd.received, 0U);
+  EXPECT_EQ (rd.closed, 0U);
+
+  ret = nns_edge_release_handle (edge_h);
+  EXPECT_EQ (ret, NNS_EDGE_ERROR_NONE);
+
+  _test_peer_stop (&peer);
+  EXPECT_TRUE (peer.sent_data);
+  SAFE_FREE (rd.meta_value);
+}
+
+/**
+ * @brief Memories on either side of each step the receive buffer grows by arrive intact.
+ */
+TEST (edgeTransfer, dataAcrossAllocSteps)
+{
+  ne_test_peer_s peer;
+  ne_test_recv_s rd;
+  nns_edge_h edge_h;
+  nns_size_t meta_len = 0;
+  void *meta;
+  const nns_size_t mib = 1024U * 1024U;
+  int ret;
+
+  meta = _test_build_meta (&meta_len);
+  ASSERT_TRUE (meta != NULL && meta_len > 0);
+
+  memset (&peer, 0, sizeof (peer));
+  memset (&rd, 0, sizeof (rd));
+  peer.port = nns_edge_get_available_port ();
+  peer.send_data = true;
+  peer.num = 4U;
+  peer.mem_size[0] = peer.mem_actual[0] = 1U;
+  peer.mem_size[1] = peer.mem_actual[1] = mib;
+  peer.mem_size[2] = peer.mem_actual[2] = mib + 1U;
+  peer.mem_size[3] = peer.mem_actual[3] = 3U * mib + 7U;
+  peer.meta_size = peer.meta_actual = meta_len;
+  peer.meta = meta;
+  ASSERT_TRUE (_test_peer_start (&peer));
+
+  edge_h = _test_sub_create ("sub-alloc-steps", &rd, NULL);
+  ASSERT_TRUE (edge_h != NULL);
+
+  ret = nns_edge_start (edge_h);
+  EXPECT_EQ (ret, NNS_EDGE_ERROR_NONE);
+  ret = nns_edge_connect (edge_h, "127.0.0.1", peer.port);
+  EXPECT_EQ (ret, NNS_EDGE_ERROR_NONE);
+
+  _test_wait_event (&rd);
+
+  EXPECT_EQ (rd.received, 1U);
+  EXPECT_EQ (rd.closed, 0U);
+  EXPECT_EQ (rd.count, 4U);
+  EXPECT_EQ (rd.len[0], 1U);
+  EXPECT_EQ (rd.len[1], mib);
+  EXPECT_EQ (rd.len[2], mib + 1U);
+  EXPECT_EQ (rd.len[3], 3U * mib + 7U);
+  EXPECT_TRUE (rd.payload_ok);
+  EXPECT_STREQ (rd.meta_value, "from-peer");
+
+  ret = nns_edge_release_handle (edge_h);
+  EXPECT_EQ (ret, NNS_EDGE_ERROR_NONE);
+
+  _test_peer_stop (&peer);
+  EXPECT_TRUE (peer.sent_data);
+  SAFE_FREE (rd.meta_value);
+  nns_edge_free (meta);
+}
+
+/**
+ * @brief A node that stops after the receive buffer has grown loses the connection.
+ * @details The buffer grown so far is released on that error path, which LeakSanitizer checks.
+ */
+TEST (edgeTransfer, dataStopsAfterAllocGrew_n)
+{
+  ne_test_peer_s peer;
+  ne_test_recv_s rd;
+  nns_edge_h edge_h;
+  int ret;
+
+  memset (&peer, 0, sizeof (peer));
+  memset (&rd, 0, sizeof (rd));
+  peer.port = nns_edge_get_available_port ();
+  peer.send_data = true;
+  peer.num = 1U;
+  peer.mem_size[0] = 8U * 1024U * 1024U;
+  peer.mem_actual[0] = 3U * 1024U * 1024U + 5U;
+  ASSERT_TRUE (_test_peer_start (&peer));
+
+  edge_h = _test_sub_create ("sub-grew-stop", &rd, NULL);
+  ASSERT_TRUE (edge_h != NULL);
+  ret = nns_edge_set_info (edge_h, "RECV_TIMEOUT", "500");
+  EXPECT_EQ (ret, NNS_EDGE_ERROR_NONE);
+
+  ret = nns_edge_start (edge_h);
+  EXPECT_EQ (ret, NNS_EDGE_ERROR_NONE);
+  ret = nns_edge_connect (edge_h, "127.0.0.1", peer.port);
+  EXPECT_EQ (ret, NNS_EDGE_ERROR_NONE);
+
+  _test_wait_event (&rd);
+
+  EXPECT_EQ (rd.received, 0U);
+  EXPECT_EQ (rd.closed, 1U);
+
+  _test_peer_stop (&peer);
+
+  ret = nns_edge_release_handle (edge_h);
+  EXPECT_EQ (ret, NNS_EDGE_ERROR_NONE);
+
+  SAFE_FREE (rd.meta_value);
+}
+
+/**
  * @brief A command whose announced total is exactly the limit is accepted.
  */
 TEST (edgeTransfer, dataAtLimit)
@@ -7267,7 +7409,7 @@ TEST (edgeTransfer, capabilityOverLimit_n)
   peer.answer_timeout_ms = 3000U;
   ASSERT_TRUE (_test_peer_start (&peer));
 
-  edge_h = _test_sub_create ("sub-cap-over", &rd, NULL);
+  edge_h = _test_sub_create ("sub-cap-over", &rd, "1024");
   ASSERT_TRUE (edge_h != NULL);
 
   ret = nns_edge_start (edge_h);
