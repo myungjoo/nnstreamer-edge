@@ -569,9 +569,10 @@ _nns_edge_parse_peer_host (const char *str, nns_size_t len, char **host,
 
 /**
  * @brief Allocate a buffer of the size the peer announced and fill it from the socket.
- * @details The buffer starts at NNS_EDGE_RECV_ALLOC_SIZE and doubles each time it is filled,
- *          so whatever size the peer announced, the receiver holds at most that first buffer
- *          or twice what the peer has really sent.
+ * @details The buffer starts at the smaller of the announced size and NNS_EDGE_RECV_ALLOC_SIZE,
+ *          and doubles each time it is filled until it reaches the announced size. Whatever the
+ *          peer announced, the receiver holds at most that first buffer or twice what the peer
+ *          has really sent.
  */
 static int
 _receive_alloc_data (nns_edge_conn_s * conn, nns_size_t size, void **data)

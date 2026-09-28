@@ -7258,6 +7258,50 @@ TEST (edgeTransfer, dataAcrossAllocSteps)
 }
 
 /**
+ * @brief A transfer that grows the receive buffer several times is accepted at exactly the limit.
+ */
+TEST (edgeTransfer, dataAcrossAllocStepsAtLimit)
+{
+  ne_test_peer_s peer;
+  ne_test_recv_s rd;
+  nns_edge_h edge_h;
+  const nns_size_t size = 3U * 1024U * 1024U + 7U;
+  char *limit;
+  int ret;
+
+  memset (&peer, 0, sizeof (peer));
+  memset (&rd, 0, sizeof (rd));
+  peer.port = nns_edge_get_available_port ();
+  peer.send_data = true;
+  peer.num = 1U;
+  peer.mem_size[0] = peer.mem_actual[0] = size;
+  ASSERT_TRUE (_test_peer_start (&peer));
+
+  limit = nns_edge_strdup_printf ("%" PRIu64, (uint64_t) size);
+  edge_h = _test_sub_create ("sub-steps-at-limit", &rd, limit);
+  nns_edge_free (limit);
+  ASSERT_TRUE (edge_h != NULL);
+
+  ret = nns_edge_start (edge_h);
+  EXPECT_EQ (ret, NNS_EDGE_ERROR_NONE);
+  ret = nns_edge_connect (edge_h, "127.0.0.1", peer.port);
+  EXPECT_EQ (ret, NNS_EDGE_ERROR_NONE);
+
+  _test_wait_event (&rd);
+
+  EXPECT_EQ (rd.received, 1U);
+  EXPECT_EQ (rd.closed, 0U);
+  EXPECT_EQ (rd.len[0], size);
+  EXPECT_TRUE (rd.payload_ok);
+
+  ret = nns_edge_release_handle (edge_h);
+  EXPECT_EQ (ret, NNS_EDGE_ERROR_NONE);
+
+  _test_peer_stop (&peer);
+  SAFE_FREE (rd.meta_value);
+}
+
+/**
  * @brief A node that stops after the receive buffer has grown loses the connection.
  * @details The buffer grown so far is released on that error path, which LeakSanitizer checks.
  */
