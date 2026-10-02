@@ -135,6 +135,7 @@ _check_mqtt_broker ()
 
   ret = system ("ps aux | grep mosquitto | grep -v grep");
   if (0 != ret) {
+    /* ubuntu_clean_cmake_build.yml greps for this text, keep it. */
     nns_edge_logw ("MQTT broker is not running. Skip query hybrid test.");
     return false;
   }
